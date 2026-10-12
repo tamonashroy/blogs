@@ -1,6 +1,6 @@
 # Designing a Minimal, Highly Available Webhook File Ingestion Service on AKS
 
-Oct 12, 2026 · @Tamonash Roy
+Oct 12, 2026 · Tamonash Roy
 
 ## The problem, and the short answer
 
@@ -21,13 +21,54 @@ Duplicate handling is deliberately out of scope here; it happens downstream. Thi
 
 ## Architecture at a glance
 
-&#91;embedded content: architecture · one must-succeed write, best-effort archive and control events\]
+```mermaid
+flowchart TB
+  partner["External partner<br/>Sends file via webhook, signed"] -->|HTTPS| apim["API gateway (APIM)<br/>Auth, file size cap,<br/>concurrency and rate limits"]
+  apim --> ingress["Internal ingress<br/>Private, TLS, gateway subnet only"]
+  subgraph aks["AKS cluster · zone-redundant node pool"]
+    pod1["Pod 1 · zone 1<br/>FastAPI, one Uvicorn worker, fixed slots"]
+    pod2["Pod 2 · zone 2<br/>FastAPI, one Uvicorn worker, fixed slots"]
+  end
+  ingress -->|to both pods| pod1
+  ingress --> pod2
+  aks -->|must succeed| ds["Downstream ADLS<br/>Transformed file"]
+  aks -.->|best effort| arch["Archive ADLS<br/>Raw + transformed"]
+  aks -.->|best effort| kafka["Kafka<br/>Control events"]
+  aks --> os["OpenSearch<br/>Logs from every pod, Grafana alerts"]
+  ds -->|polls for new files| dbx["Azure Databricks<br/>Ingests new files"]
+  kafka -->|consumers write rows| sql["Azure SQL<br/>Control tables"]
+  classDef main fill:#e3eefc,stroke:#2b6cd4,stroke-width:2px
+  classDef best stroke-dasharray: 5 4
+  class ds main
+  class arch,kafka best
+```
+
+*Solid = must succeed. Dashed = if it is down, work is parked and replayed; the call still succeeds.*
 
 Only the gateway is public. The pods write the transformed file to downstream ADLS, where Databricks picks it up. Archive copies and control events are best effort: control events go to Kafka, and the existing consumers write them to SQL. Every pod ships its logs to OpenSearch, where Grafana watches for failures.
 
 ## How one file flows through
 
-&#91;embedded content: request flow · one API call, 2 best-effort archive steps\]
+```mermaid
+flowchart TB
+  gw["Gateway checks the request<br/>Signature, file size, concurrency"] -->|fails| rej["Reject early<br/>401, 413, 429 or 503"]
+  gw -->|passes| door["API front door<br/>Size check again, take a pod slot"]
+  door -->|fails| rej
+  door --> rec["Publish RECEIVED event<br/>Kafka, parked in ADLS if it is down"]
+  rec --> rawarc["Archive raw file<br/>Best effort: parked if archive is down"]
+  rawarc --> tf["Load into pandas, transform<br/>Transform only if config says so"]
+  tf --> ds["Write to downstream ADLS<br/>Temp name, then atomic rename"]
+  tf -->|on error| failed["Publish FAILED event<br/>Return 500, nothing sent downstream"]
+  ds -->|on error| failed
+  ds --> tfarc["Archive transformed copy<br/>Best effort: parked if archive is down"]
+  tfarc --> landed["Publish LANDED, return 200<br/>Event carries record and key counts"]
+  classDef main fill:#e3eefc,stroke:#2b6cd4,stroke-width:2px
+  classDef bad stroke:#d03b3b,stroke-width:2px
+  classDef best stroke-dasharray: 5 4
+  class ds main
+  class rej,failed bad
+  class rec,rawarc,tfarc best
+```
 
 Bad requests die before pandas loads anything. After that, only two steps can fail the call: the transform and the downstream write. Every dashed step, the archive copies and the control events, falls back to parking its work instead of failing.
 
@@ -227,6 +268,29 @@ In one line: **police at the edge, do the work in one call, protect the one writ
 
 ## End to end: who does what
 
-&#91;embedded content: end to end · 4 stages, upstream to downstream\]
+```mermaid
+flowchart TB
+  subgraph up["Upstream · data provider"]
+    s1["1 · External data provider calls the webhook<br/>One signed file per call; retries on 429 or 5xx"]
+  end
+  subgraph ours["Our team · API layer"]
+    s2["2 · API layer receives, transforms and writes<br/>Gateway caps size and parallel calls<br/>FastAPI on AKS transforms with pandas<br/>Publishes control events; 200 only once the file is in ADLS"]
+  end
+  subgraph ho["Handover · shared ADLS"]
+    s3["3 · ADLS downstream location holds the file<br/>Complete files only"]
+  end
+  subgraph down["Downstream · data team"]
+    s4["4 · Databricks jobs ingest the data"]
+    full["Full load<br/>Rebuilds the table from every file"]
+    inc["Incremental load<br/>Only files not seen before, e.g. Auto Loader"]
+    s4 --> full
+    s4 --> inc
+  end
+  s1 -->|HTTPS POST, signed| s2
+  s2 -->|writes the transformed file| s3
+  s3 -->|jobs pick up new files| s4
+  classDef main fill:#e3eefc,stroke:#2b6cd4,stroke-width:2px
+  class s2 main
+```
 
 The data provider only pushes; Databricks only pulls. ADLS is the contract between them: once a complete file sits in the downstream location, our job is done, and the data team decides whether to load it fully or incrementally.
